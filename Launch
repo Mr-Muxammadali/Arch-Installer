@@ -1,0 +1,14 @@
+# Подключение к Wi-Fi, если необходимо
+iwctl
+
+# Проверка интернета
+ping -c 3 archlinux.org
+
+# Клонирование репозитория
+git clone https://github.com/USERNAME/REPOSITORY.git
+
+cd REPOSITORY
+
+# Запуск
+chmod +x install.sh
+./install.sh

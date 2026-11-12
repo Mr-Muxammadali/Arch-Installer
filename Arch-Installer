@@ -1,0 +1,597 @@
+
+#!/usr/bin/env bash
+
+# ============================================================
+# ARCH LINUX INSTALLER
+# Target: HP Laptop 15-dw3xxx
+#
+# Distribution : Arch Linux
+# Init         : systemd
+# Kernel       : linux-zen
+# Desktop      : Vanilla GNOME / Wayland
+# Display Mgr  : GDM
+# Bootloader   : GRUB / UEFI
+# Filesystem   : ext4
+# Swap         : 8 GiB partition
+# GPU          : Intel iGPU + NVIDIA MX350
+#
+# WARNING:
+# /dev/nvme0n1 WILL BE COMPLETELY ERASED!
+#
+# Run from official Arch Linux Live ISO.
+# ============================================================
+
+set -Eeuo pipefail
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+DISK="/dev/nvme0n1"
+HOSTNAME="hp-arch"
+TIMEZONE="Asia/Tashkent"
+LANG="en_US.UTF-8"
+MOUNT="/mnt"
+
+EFI_SIZE="1G"
+SWAP_SIZE="8G"
+
+EFI="${DISK}p1"
+SWAP="${DISK}p2"
+ROOT="${DISK}p3"
+
+USERNAME=""
+
+# ============================================================
+# ERROR HANDLING
+# ============================================================
+
+trap '
+    echo
+    echo "============================================"
+    echo " INSTALLATION FAILED"
+    echo " Line: $LINENO"
+    echo "============================================"
+    echo "Check the error above before continuing."
+' ERR
+
+# ============================================================
+# PRE-INSTALLATION CHECKS
+# ============================================================
+
+echo
+echo "============================================"
+echo " ARCH LINUX INSTALLER"
+echo "============================================"
+echo
+
+if [[ "$EUID" -ne 0 ]]; then
+    echo "ERROR: Run as root."
+    exit 1
+fi
+
+if [[ ! -d /sys/firmware/efi ]]; then
+    echo "ERROR: Boot the Live ISO in UEFI mode."
+    exit 1
+fi
+
+for cmd in sfdisk wipefs lsblk pacstrap genfstab \
+           arch-chroot mkfs.fat mkfs.ext4 \
+           mkswap swapon swapoff partprobe; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "ERROR: Missing command: $cmd"
+        exit 1
+    fi
+done
+
+if [[ ! -b "$DISK" ]]; then
+    echo "ERROR: Disk not found: $DISK"
+    exit 1
+fi
+
+if [[ "$(lsblk -dnro TYPE "$DISK")" != "disk" ]]; then
+    echo "ERROR: Target is not a physical disk."
+    exit 1
+fi
+
+# ------------------------------------------------------------
+# Disk information
+# ------------------------------------------------------------
+
+echo "Target disk information:"
+echo
+
+lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS,MODEL "$DISK"
+
+echo
+echo "WARNING: ALL DATA ON $DISK WILL BE DESTROYED!"
+echo
+
+# ------------------------------------------------------------
+# Mounted partition check
+# ------------------------------------------------------------
+
+if lsblk -nrpo MOUNTPOINT "$DISK" | grep -q '[^[:space:]]'; then
+    echo "ERROR: Target disk contains mounted partitions."
+    echo "Unmount them before running this installer."
+    exit 1
+fi
+
+# ------------------------------------------------------------
+# Active swap check
+# ------------------------------------------------------------
+
+while read -r active_swap; do
+    case "$active_swap" in
+        "$DISK"|"$DISK"p*)
+            echo "ERROR: Target disk has active swap: $active_swap"
+            exit 1
+            ;;
+    esac
+done < <(swapon --noheadings --raw --output=NAME)
+
+# ------------------------------------------------------------
+# Mount directory check
+# ------------------------------------------------------------
+
+if findmnt -rn -o TARGET | grep -Eq '^/mnt(/|$)'; then
+    echo "ERROR: /mnt already has mounted filesystems."
+    exit 1
+fi
+
+# ============================================================
+# USER CONFIGURATION
+# ============================================================
+
+read -rp "Enter username: " USERNAME
+
+if [[ ! "$USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+    echo "ERROR: Invalid username."
+    exit 1
+fi
+
+read -rsp "Enter root password: " ROOT_PASSWORD
+echo
+
+read -rsp "Confirm root password: " ROOT_PASSWORD_CONFIRM
+echo
+
+if [[ "$ROOT_PASSWORD" != "$ROOT_PASSWORD_CONFIRM" ]]; then
+    echo "ERROR: Root passwords do not match."
+    exit 1
+fi
+
+read -rsp "Enter user password: " USER_PASSWORD
+echo
+
+read -rsp "Confirm user password: " USER_PASSWORD_CONFIRM
+echo
+
+if [[ "$USER_PASSWORD" != "$USER_PASSWORD_CONFIRM" ]]; then
+    echo "ERROR: User passwords do not match."
+    exit 1
+fi
+
+# ============================================================
+# NETWORK CHECK
+# ============================================================
+
+echo
+echo "Checking internet connection..."
+
+if ! curl -fsS --connect-timeout 10 \
+    https://archlinux.org >/dev/null; then
+    echo "ERROR: Internet connection unavailable."
+    exit 1
+fi
+
+timedatectl set-ntp true || true
+
+# ============================================================
+# CPU MICROCODE DETECTION
+# ============================================================
+
+CPU_VENDOR=$(awk -F ': ' \
+    '/vendor_id/ {print $2; exit}' /proc/cpuinfo)
+
+case "$CPU_VENDOR" in
+    GenuineIntel)
+        MICROCODE="intel-ucode"
+        ;;
+    AuthenticAMD)
+        MICROCODE="amd-ucode"
+        ;;
+    *)
+        echo "ERROR: Unsupported CPU vendor: $CPU_VENDOR"
+        exit 1
+        ;;
+esac
+
+echo "CPU vendor: $CPU_VENDOR"
+echo "Microcode: $MICROCODE"
+
+# ============================================================
+# FINAL DESTRUCTIVE CONFIRMATION
+# ============================================================
+
+echo
+echo "============================================"
+echo " FINAL DISK CONFIRMATION"
+echo "============================================"
+echo
+echo "Disk: $DISK"
+echo "EFI : 1 GiB"
+echo "SWAP: 8 GiB"
+echo "ROOT: Remaining space"
+echo
+echo "Everything on this disk will be erased."
+echo
+
+read -rp "Type ERASE $DISK to continue: " CONFIRM
+
+if [[ "$CONFIRM" != "ERASE $DISK" ]]; then
+    echo "Installation cancelled."
+    exit 1
+fi
+
+# ============================================================
+# DISK PARTITIONING
+# ============================================================
+
+echo
+echo "Creating GPT partition table..."
+
+wipefs --all --force "$DISK"
+
+sfdisk --wipe always --wipe-partitions always "$DISK" <<EOF
+label: gpt
+,${EFI_SIZE},U
+,${SWAP_SIZE},S
+,,L
+EOF
+
+partprobe "$DISK"
+udevadm settle
+
+# Wait for partition devices
+for partition in "$EFI" "$SWAP" "$ROOT"; do
+    for attempt in {1..10}; do
+        [[ -b "$partition" ]] && break
+        sleep 1
+    done
+
+    if [[ ! -b "$partition" ]]; then
+        echo "ERROR: Partition not found: $partition"
+        exit 1
+    fi
+done
+
+echo
+echo "Partition table:"
+lsblk "$DISK"
+
+# ============================================================
+# FILESYSTEM CREATION
+# ============================================================
+
+echo
+echo "Creating filesystems..."
+
+mkfs.fat -F32 "$EFI"
+
+mkswap "$SWAP"
+
+mkfs.ext4 -F "$ROOT"
+
+# Activate swap
+swapon "$SWAP"
+
+# ============================================================
+# MOUNTING
+# ============================================================
+
+echo
+echo "Mounting filesystems..."
+
+mkdir -p "$MOUNT"
+
+mount "$ROOT" "$MOUNT"
+
+mkdir -p "$MOUNT/boot"
+
+mount "$EFI" "$MOUNT/boot"
+
+# ============================================================
+# BASE SYSTEM
+# ============================================================
+
+BASE_PACKAGES=(
+    base
+    base-devel
+
+    linux-zen
+    linux-zen-headers
+    linux-firmware
+
+    "$MICROCODE"
+
+    grub
+    efibootmgr
+
+    networkmanager
+    sudo
+
+    git
+    curl
+    wget
+
+    vim
+    nano
+
+    man-db
+    man-pages
+
+    dosfstools
+    mtools
+)
+
+echo
+echo "Installing base Arch Linux system..."
+
+pacstrap -K "$MOUNT" "${BASE_PACKAGES[@]}"
+
+# ============================================================
+# FSTAB
+# ============================================================
+
+echo
+echo "Generating fstab..."
+
+genfstab -U "$MOUNT" > "$MOUNT/etc/fstab"
+
+cat "$MOUNT/etc/fstab"
+
+# ============================================================
+# SYSTEM CONFIGURATION
+# ============================================================
+
+echo
+echo "Configuring system..."
+
+arch-chroot "$MOUNT" ln -sf \
+    "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
+
+arch-chroot "$MOUNT" hwclock --systohc
+
+# ============================================================
+# LOCALIZATION
+# ============================================================
+
+echo
+echo "Configuring locales..."
+
+sed -i \
+    -e 's/^#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' \
+    -e 's/^#ru_RU.UTF-8 UTF-8/ru_RU.UTF-8 UTF-8/' \
+    -e 's/^#uz_UZ.UTF-8 UTF-8/uz_UZ.UTF-8 UTF-8/' \
+    "$MOUNT/etc/locale.gen"
+
+arch-chroot "$MOUNT" locale-gen
+
+echo "LANG=$LANG" > "$MOUNT/etc/locale.conf"
+
+echo "KEYMAP=us" > "$MOUNT/etc/vconsole.conf"
+
+# ============================================================
+# HOSTNAME
+# ============================================================
+
+echo "$HOSTNAME" > "$MOUNT/etc/hostname"
+
+cat > "$MOUNT/etc/hosts" <<EOF
+127.0.0.1 localhost
+::1 localhost
+127.0.1.1 $HOSTNAME.localdomain $HOSTNAME
+EOF
+
+# ============================================================
+# PACMAN CONFIGURATION
+# ============================================================
+
+sed -i \
+    -e 's/^#Color/Color/' \
+    -e 's/^#ParallelDownloads = 5/ParallelDownloads = 5/' \
+    "$MOUNT/etc/pacman.conf"
+
+# ============================================================
+# USER CREATION
+# ============================================================
+
+echo
+echo "Creating user: $USERNAME"
+
+arch-chroot "$MOUNT" useradd \
+    -m \
+    -G wheel \
+    -s /bin/bash \
+    "$USERNAME"
+
+printf 'root:%s\n' "$ROOT_PASSWORD" | \
+    arch-chroot "$MOUNT" chpasswd
+
+printf '%s:%s\n' "$USERNAME" "$USER_PASSWORD" | \
+    arch-chroot "$MOUNT" chpasswd
+
+unset ROOT_PASSWORD ROOT_PASSWORD_CONFIRM
+unset USER_PASSWORD USER_PASSWORD_CONFIRM
+
+# Configure sudo
+mkdir -p "$MOUNT/etc/sudoers.d"
+
+echo "%wheel ALL=(ALL:ALL) ALL" \
+    > "$MOUNT/etc/sudoers.d/10-wheel"
+
+chmod 440 "$MOUNT/etc/sudoers.d/10-wheel"
+
+arch-chroot "$MOUNT" visudo -c
+
+# ============================================================
+# GNOME DESKTOP
+# ============================================================
+
+DESKTOP_PACKAGES=(
+    gnome
+    gdm
+
+    gnome-tweaks
+
+    firefox
+
+    pipewire
+    pipewire-audio
+    pipewire-alsa
+    pipewire-pulse
+    wireplumber
+    pavucontrol
+
+    mesa
+    vulkan-intel
+    intel-media-driver
+    libva-utils
+
+    noto-fonts
+    noto-fonts-cjk
+    noto-fonts-emoji
+    ttf-dejavu
+
+    bluez
+    bluez-utils
+
+    power-profiles-daemon
+    fwupd
+
+    gvfs
+    gvfs-mtp
+    xdg-user-dirs
+    xdg-utils
+
+    android-tools
+    ntfs-3g
+    p7zip
+    jq
+    htop
+    fastfetch
+)
+
+echo
+echo "Installing Vanilla GNOME and desktop packages..."
+
+arch-chroot "$MOUNT" pacman \
+    -S --needed --noconfirm "${DESKTOP_PACKAGES[@]}"
+
+# ============================================================
+# INITRAMFS
+# ============================================================
+
+echo
+echo "Generating initramfs..."
+
+arch-chroot "$MOUNT" mkinitcpio -P
+
+# ============================================================
+# GRUB BOOTLOADER
+# ============================================================
+
+echo
+echo "Installing GRUB..."
+
+arch-chroot "$MOUNT" grub-install \
+    --target=x86_64-efi \
+    --efi-directory=/boot \
+    --bootloader-id=ArchLinux \
+    --recheck
+
+arch-chroot "$MOUNT" grub-mkconfig \
+    -o /boot/grub/grub.cfg
+
+# ============================================================
+# SYSTEMD SERVICES
+# ============================================================
+
+echo
+echo "Enabling system services..."
+
+arch-chroot "$MOUNT" systemctl enable \
+    NetworkManager.service
+
+arch-chroot "$MOUNT" systemctl enable \
+    gdm.service
+
+arch-chroot "$MOUNT" systemctl enable \
+    bluetooth.service
+
+arch-chroot "$MOUNT" systemctl enable \
+    power-profiles-daemon.service
+
+arch-chroot "$MOUNT" systemctl enable \
+    fstrim.timer
+
+# ============================================================
+# FINAL VALIDATION
+# ============================================================
+
+echo
+echo "Checking installed kernel..."
+
+arch-chroot "$MOUNT" pacman -Q \
+    linux-zen \
+    linux-zen-headers \
+    grub \
+    gnome-shell \
+    gdm
+
+echo
+echo "Checking fstab..."
+
+findmnt --verify --tab-file "$MOUNT/etc/fstab"
+
+# ============================================================
+# FINISH
+# ============================================================
+
+echo
+echo "============================================"
+echo " ARCH LINUX INSTALLATION COMPLETED"
+echo "============================================"
+echo
+echo "Hostname : $HOSTNAME"
+echo "Username : $USERNAME"
+echo "Kernel   : linux-zen"
+echo "Desktop  : Vanilla GNOME"
+echo "Display  : Wayland / GDM"
+echo "Boot     : GRUB / UEFI"
+echo "Root     : ext4"
+echo "Swap     : 8 GiB"
+echo
+echo "NVIDIA MX350 driver: NOT INSTALLED"
+echo "Intel graphics: Mesa / Vulkan installed"
+echo
+
+echo "Final partition layout:"
+lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS "$DISK"
+
+echo
+
+umount -R "$MOUNT"
+
+swapoff "$SWAP"
+
+echo
+read -rp "Reboot now? [y/N]: " REBOOT
+
+if [[ "$REBOOT" =~ ^[Yy]$ ]]; then
+    reboot
+else
+    echo "Installation finished. Reboot manually when ready."
+fi
+
